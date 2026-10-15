@@ -1,0 +1,12 @@
+/.venv
+/dataset_versions
+/outputs
+
+/runs
+*.pt
+*.engine
+*.onnx
+
+__pycache__/
+*.py[cod]
+*$py.class
