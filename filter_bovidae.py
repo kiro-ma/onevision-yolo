@@ -2,65 +2,97 @@
 filter_bovidae.py
 -----------------
 Filtra o dataset AP-10K localmente, copiando apenas as imagens e labels
-de animais da família Bovidae (antelope, argali sheep, bison, buffalo, cow, sheep)
-para um novo dataset YOLO pronto para fine-tuning.
+de animais das famílias Bovidae e Cervidae que possuem pose quadrupedal
+completa e em pé (exigindo cernelha/neck, garupa/root_of_tail e pelo menos
+3 patas visíveis), limpando close-ups de cabeça e animais deitados/ocultos.
 
 Uso:
     python filter_bovidae.py
 
 Saída:
     dataset_versions/ap-10k-bovidae/
-        train/images/   (862 imagens)
-        train/labels/   (862 labels .txt)
-        valid/images/   (56 imagens)
-        valid/labels/   (56 labels .txt)
+        train/images/
+        train/labels/
+        valid/images/
+        valid/labels/
         data.yaml
 """
 
 import json
-import os
 import shutil
 from pathlib import Path
 from collections import defaultdict
 
 # ── Configuração ──────────────────────────────────────────────────────────────
 AP10K_DIR = Path("dataset_versions/ap-10k")
-OUT_DIR    = Path("dataset_versions/ap-10k-bovidae")
+OUT_DIR   = Path("dataset_versions/ap-10k-bovidae")
 
-SUPERCATEGORIA_ALVO = "Bovidae"
+SUPERCATEGORIAS_ALVO = {"Bovidae", "Cervidae"}
 
-# Inclui também Suidae (porco) e Cervidae (cervo/alce) por similaridade morfológica
-# com caprinos. Comente as linhas abaixo para manter apenas Bovidae puros.
-SUPERCATEGORIAS_EXTRAS = []   # ex: ["Suidae", "Cervidae"]
+# Índices dos keypoints no AP-10K (formato [x0, y0, v0, x1, y1, v1, ...])
+IDX_NECK         = 3
+IDX_ROOT_OF_TAIL = 4
+IDX_PAWS         = (7, 10, 13, 16)  # L_F_Paw, R_F_Paw, L_B_Paw, R_B_Paw
+MIN_PAWS_VISIVEIS = 3
+
+# Como os diretórios train/ (8012 imgs) e valid/ (2003 imgs) no disco já estão
+# particionados fisicamente, lemos os 3 arquivos do split1 (que cobrem 100% das
+# 10.015 imagens do AP-10K sem triplicar contagens) e cruzamos com cada pasta.
+ANNOTATION_FILES = [
+    "ap10k-train-split1.json",
+    "ap10k-val-split1.json",
+    "ap10k-test-split1.json",
+]
 
 SPLITS = {
     "train": {
-        "annotations": ["ap10k-train-split1.json", "ap10k-train-split2.json", "ap10k-train-split3.json"],
-        "img_dir":     AP10K_DIR / "train" / "images",
-        "lbl_dir":     AP10K_DIR / "train" / "labels",
-        "out_img":     OUT_DIR / "train" / "images",
-        "out_lbl":     OUT_DIR / "train" / "labels",
+        "img_dir": AP10K_DIR / "train" / "images",
+        "lbl_dir": AP10K_DIR / "train" / "labels",
+        "out_img": OUT_DIR / "train" / "images",
+        "out_lbl": OUT_DIR / "train" / "labels",
     },
     "valid": {
-        "annotations": ["ap10k-val-split1.json", "ap10k-val-split2.json", "ap10k-val-split3.json"],
-        "img_dir":     AP10K_DIR / "valid" / "images",
-        "lbl_dir":     AP10K_DIR / "valid" / "labels",
-        "out_img":     OUT_DIR / "valid" / "images",
-        "out_lbl":     OUT_DIR / "valid" / "labels",
+        "img_dir": AP10K_DIR / "valid" / "images",
+        "lbl_dir": AP10K_DIR / "valid" / "labels",
+        "out_img": OUT_DIR / "valid" / "images",
+        "out_lbl": OUT_DIR / "valid" / "labels",
     },
 }
 
-# ── Funções ───────────────────────────────────────────────────────────────────
-def coletar_arquivos_bovidae(split_cfg: dict) -> set:
-    """
-    Varre os arquivos de anotação COCO do AP-10K e retorna o conjunto
-    de file_names (ex: '000000000371.jpg') que pertencem às supercategorias-alvo.
-    """
-    supercats_alvo = {SUPERCATEGORIA_ALVO} | set(SUPERCATEGORIAS_EXTRAS)
-    filenames_alvo = set()
-    especie_count  = defaultdict(int)
 
-    for ann_file in split_cfg["annotations"]:
+# ── Funções ───────────────────────────────────────────────────────────────────
+def validar_anotacao_anatomica(keypoints: list) -> bool:
+    """
+    Verifica se a anotação possui geometria útil para biometria lateral:
+    - neck (cernelha/pescoço, idx 3) visível (v > 0)
+    - root_of_tail (garupa, idx 4) visível (v > 0)
+    - pelo menos 3 das 4 patas (idxs 7, 10, 13, 16) visíveis (v > 0)
+    """
+    if not keypoints or len(keypoints) < 51:
+        return False
+
+    neck_visivel = keypoints[IDX_NECK * 3 + 2] > 0
+    tail_visivel = keypoints[IDX_ROOT_OF_TAIL * 3 + 2] > 0
+    patas_visiveis = sum(1 for idx in IDX_PAWS if keypoints[idx * 3 + 2] > 0)
+
+    return neck_visivel and tail_visivel and (patas_visiveis >= MIN_PAWS_VISIVEIS)
+
+
+def coletar_arquivos_filtrados(split_cfg: dict) -> tuple[set, dict, dict]:
+    """
+    Varre os arquivos de anotação COCO do AP-10K e retorna apenas os file_names
+    presentes no split de disco que pertençam a Bovidae/Cervidae e atendam à
+    regra estrita de visibilidade anatômica.
+    """
+    img_src_dir = split_cfg["img_dir"]
+    filenames_validos = set()
+    especie_count = defaultdict(int)
+    stats = {"total_candidatas": 0, "rejeitadas_anatomia": 0, "aceitas": 0}
+
+    # Agrupa anotações da supercategoria-alvo por imagem presente neste split
+    img_annotations = defaultdict(list)
+
+    for ann_file in ANNOTATION_FILES:
         ann_path = AP10K_DIR / "annotations" / ann_file
         if not ann_path.exists():
             print(f"  [AVISO] Arquivo não encontrado: {ann_path}")
@@ -69,47 +101,71 @@ def coletar_arquivos_bovidae(split_cfg: dict) -> set:
         with open(ann_path, encoding="utf-8") as f:
             data = json.load(f)
 
-        # Mapeia category_id → (nome, supercategoria)
         cat_map = {
             c["id"]: (c["name"], c["supercategory"])
             for c in data["categories"]
         }
-
-        # IDs das categorias alvo
         cat_ids_alvo = {
-            cid for cid, (nome, supercat) in cat_map.items()
-            if supercat in supercats_alvo
+            cid for cid, (_, supercat) in cat_map.items()
+            if supercat in SUPERCATEGORIAS_ALVO
         }
-
-        # image_id → file_name
         img_map = {img["id"]: img["file_name"] for img in data["images"]}
 
         for ann in data["annotations"]:
             if ann["category_id"] in cat_ids_alvo:
-                nome_especie = cat_map[ann["category_id"]][0]
                 fname = img_map.get(ann["image_id"])
-                if fname:
-                    filenames_alvo.add(fname)
-                    especie_count[nome_especie] += 1
+                if fname and (img_src_dir / fname).exists():
+                    nome_especie = cat_map[ann["category_id"]][0]
+                    img_annotations[fname].append((nome_especie, ann.get("keypoints", [])))
 
-    return filenames_alvo, especie_count
+    for fname, anns in img_annotations.items():
+        stats["total_candidatas"] += 1
+        anns_validas = [esp for esp, kpts in anns if validar_anotacao_anatomica(kpts)]
+
+        # Rejeita também imagens com close-ups puros de cabeça misturados (0 patas visíveis)
+        tem_closeup_sem_pata = any(
+            sum(1 for idx in IDX_PAWS if kpts[idx * 3 + 2] > 0) == 0
+            for _, kpts in anns if len(kpts) >= 51
+        )
+
+        if anns_validas and not tem_closeup_sem_pata:
+            filenames_validos.add(fname)
+            stats["aceitas"] += 1
+            for esp in anns_validas:
+                especie_count[esp] += 1
+        else:
+            stats["rejeitadas_anatomia"] += 1
+
+    return filenames_validos, especie_count, stats
 
 
 def copiar_split(split_name: str, split_cfg: dict) -> dict:
-    """Copia imagens e labels Bovidae para o diretório de saída."""
-    print("\n" + "-"*55)
-    print("  Processando split: " + split_name.upper())
-    print("-"*55)
+    """Limpa o diretório antigo e copia apenas imagens e labels aprovados no filtro estrito."""
+    print("\n" + "-" * 60)
+    print(f"  Processando split: {split_name.upper()}")
+    print("-" * 60)
 
-    filenames, especie_count = coletar_arquivos_bovidae(split_cfg)
-    print(f"  Espécies e contagem de anotações:")
+    filenames, especie_count, stats = coletar_arquivos_filtrados(split_cfg)
+    print(f"  Imagens Bovidae/Cervidae no split: {stats['total_candidatas']}")
+    print(f"  Rejeitadas (close-up/deitado/<3 patas): {stats['rejeitadas_anatomia']}")
+    print(f"  Aprovadas (corpo inteiro em pé):        {stats['aceitas']}")
+    print("\n  Espécies e contagem de instâncias válidas:")
     for esp, qtd in sorted(especie_count.items(), key=lambda x: -x[1]):
-        print(f"    {esp:<20} {qtd:>5} anotações")
+        print(f"    {esp:<22} {qtd:>5} anotações")
 
     img_src_dir = split_cfg["img_dir"]
     lbl_src_dir = split_cfg["lbl_dir"]
     out_img_dir = split_cfg["out_img"]
     out_lbl_dir = split_cfg["out_lbl"]
+
+    # Remove arquivos antigos e caches do YOLO para garantir que imagens rejeitadas não permaneçam
+    if out_img_dir.exists():
+        shutil.rmtree(out_img_dir)
+    if out_lbl_dir.exists():
+        shutil.rmtree(out_lbl_dir)
+    cache_file = out_lbl_dir.with_suffix(".cache")
+    if cache_file.exists():
+        cache_file.unlink()
 
     out_img_dir.mkdir(parents=True, exist_ok=True)
     out_lbl_dir.mkdir(parents=True, exist_ok=True)
@@ -131,20 +187,22 @@ def copiar_split(split_name: str, split_cfg: dict) -> dict:
         shutil.copy2(lbl_src, out_lbl_dir / fname.replace(".jpg", ".txt"))
         copiados += 1
 
-    print("  OK Copiados:        " + str(copiados) + " pares imagem+label")
+    print(f"\n  OK Copiados:        {copiados} pares imagem+label")
     if sem_imagem:
-        print("  AVISO Sem imagem:      " + str(sem_imagem))
+        print(f"  AVISO Sem imagem:   {sem_imagem}")
     if sem_label:
-        print("  AVISO Sem label YOLO:  " + str(sem_label))
+        print(f"  AVISO Sem label:    {sem_label}")
 
-    return {"copiados": copiados, "sem_imagem": sem_imagem, "sem_label": sem_label}
+    return {"copiados": copiados, "rejeitadas": stats["rejeitadas_anatomia"]}
 
 
 def gerar_data_yaml():
-    """Gera o data.yaml do subconjunto Bovidae com topologia quadrupedal correta."""
-    yaml_content = """# Dataset AP-10K filtrado — apenas família Bovidae
-# Espécies: antelope, argali sheep, bison, buffalo, cow, sheep
-# Morfologia quadrupedal — compatível com caprinos (Capridae)
+    """
+    Gera o data.yaml do subconjunto Bovidae + Cervidae com topologia quadrupedal
+    e kpt_oks_sigmas nativo do Ultralytics 8.4 para penalizar desvios nas patas.
+    """
+    yaml_content = """# Dataset AP-10K estrito — famílias Bovidae e Cervidae (apenas corpo inteiro em pé)
+# Exige neck, root_of_tail e >= 3 patas visíveis (sem close-ups de cabeça ou animais deitados)
 
 train: ../train/images
 val: ../valid/images
@@ -154,6 +212,18 @@ names: ['animal']
 
 kpt_shape: [17, 3]
 flip_idx: [1, 0, 2, 3, 4, 8, 9, 10, 5, 6, 7, 14, 15, 16, 11, 12, 13]
+
+# Sigmas OKS customizados por keypoint (nativo Ultralytics PoseTrainer/PoseValidator)
+# Valores reduzidos em cotovelos/joelhos (0.030) e patas/cascos (0.020) para punir troca E/D
+kpt_oks_sigmas: [
+  0.025, 0.025, 0.026,
+  0.035, 0.050,
+  0.065, 0.030, 0.020,
+  0.065, 0.030, 0.020,
+  0.065, 0.030, 0.020,
+  0.065, 0.030, 0.020
+]
+
 skeleton: [
   [0, 1], [0, 2], [1, 2],
   [2, 3],
@@ -166,15 +236,15 @@ skeleton: [
 """
     out_yaml = OUT_DIR / "data.yaml"
     out_yaml.write_text(yaml_content, encoding="utf-8")
-    print("\n  OK data.yaml gerado em: " + str(out_yaml))
+    print(f"\n  OK data.yaml gerado em: {out_yaml}")
 
 
 # ── Execução ──────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("=" * 55)
-    print("  AP-10K -> Filtro Bovidae")
+    print("=" * 60)
+    print("  AP-10K -> Filtro Estrito (Bovidae + Cervidae | Corpo Inteiro)")
     print(f"  Saída: {OUT_DIR.resolve()}")
-    print("=" * 55)
+    print("=" * 60)
 
     resultados = {}
     for split_name, split_cfg in SPLITS.items():
@@ -182,11 +252,12 @@ if __name__ == "__main__":
 
     gerar_data_yaml()
 
-    print("\n" + "="*55)
+    print("\n" + "=" * 60)
     print("  RESUMO FINAL")
-    print("="*55)
+    print("=" * 60)
     for split_name, res in resultados.items():
-        print("  " + split_name.ljust(8) + ": " + str(res['copiados']) + " pares copiados")
-    print("\n  Dataset pronto em: " + str(OUT_DIR.resolve()))
-    print("  Proximo passo: python trainAP10k.py --data ap-10k-bovidae")
-    print("="*55)
+        print(f"  {split_name:<8}: {res['copiados']:>4} pares limpos copiados ({res['rejeitadas']} descartados)")
+    print(f"\n  Dataset pronto em: {OUT_DIR.resolve()}")
+    print("  Próximo passo: python trainAP10k.py")
+    print("=" * 60)
+
