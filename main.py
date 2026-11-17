@@ -257,17 +257,28 @@ def estimar_biometria_autonoma(kpts, dist_cm=160.0, img_w=4080.0):
             pata_tras_y = (0.45 * pata_tras_y) + (0.55 * pata_diant_y)
         elif info_diant["colapsado"] and not info_tras["colapsado"] and abs(diff_solo) > desnivel_max_natural:
             pata_diant_y = (0.45 * pata_diant_y) + (0.55 * pata_tras_y)
+    elif pata_diant_y is None and pata_tras_y is not None:
+        pata_diant_y = pata_tras_y
+    elif pata_tras_y is None and pata_diant_y is not None:
+        pata_tras_y = pata_diant_y
+    elif pata_diant_y is None and pata_tras_y is None:
+        # Fallback para o ponto mais baixo dos membros caso as patas tenham baixa confiança
+        ys_membros = [kpts[i][1] for i in range(5, 17) if kpts[i][1] > 0]
+        if ys_membros:
+            y_solo_fb = float(max(ys_membros))
+            pata_diant_y = y_solo_fb
+            pata_tras_y = y_solo_fb
 
     estimativas = {}
 
     # 1. Altura da Cernelha
-    if pts["neck"][2] >= min_conf and pata_diant_y is not None:
+    if pata_diant_y is not None and pts["neck"][1] > 0:
         cernelha_px = abs(pata_diant_y - pts["neck"][1])
         estimativas["altura_cernelha_cm"] = cernelha_px / px_per_cm
         estimativas["cernelha_px"] = cernelha_px
 
     # 2. Altura da Garupa (compensa a diferença anatômica entre a inserção alta da cauda no AP-10K e o plano sacral)
-    if pts["root_of_tail"][2] >= min_conf and pata_tras_y is not None:
+    if pata_tras_y is not None and pts["root_of_tail"][1] > 0:
         # Usa a referência sacral interpolada com o quadril visível para evitar superestimar quando a cauda é alta
         hips_valid = [pts["left_hip"][1] for p in [pts["left_hip"]] if p[2] >= min_conf] + \
                      [pts["right_hip"][1] for p in [pts["right_hip"]] if p[2] >= min_conf]
@@ -280,13 +291,15 @@ def estimar_biometria_autonoma(kpts, dist_cm=160.0, img_w=4080.0):
         estimativas["garupa_px"] = garupa_px
 
     # 3. Comprimento Corporal
+    if comp_tronco_px is None and pts["neck"][0] > 0 and pts["root_of_tail"][0] > 0:
+        comp_tronco_px = calcular_distancia(pts["neck"][:2], pts["root_of_tail"][:2])
     if comp_tronco_px is not None:
         comp_cm = (comp_tronco_px / px_per_cm) * 0.85
         estimativas["comprimento_cm"] = comp_cm
         estimativas["comprimento_px"] = comp_tronco_px
 
     # 4. Comprimento e Grossura do Pescoço
-    if pts["nose"][2] >= min_conf and pts["neck"][2] >= min_conf:
+    if pts["nose"][0] > 0 and pts["neck"][0] > 0:
         comp_cabeca_px = calcular_distancia(pts["nose"][:2], pts["neck"][:2])
         comp_cabeca_cm = comp_cabeca_px / px_per_cm
         estimativas["comprimento_cabeca_cm"] = comp_cabeca_cm
@@ -401,32 +414,44 @@ def resolver_modelo_padrao(caminho_preferido="./runs/pose/onevision-yolo/caprine
 
 
 def executar_inferencia(image_path, model_path="./runs/pose/onevision-yolo/caprine-bovidae-v4-strict-clean/weights/best.pt",
-                        dist_cm=None, conf_thresh=0.25, ground_truth_file=None, imgsz=1280):
+                        dist_cm=None, conf_thresh=0.25, ground_truth_file=None, imgsz=1280,
+                        model=None, save_image=True, verbose=True):
     if not os.path.exists(image_path):
         print(f"ERRO: Imagem '{image_path}' não encontrada.")
-        return
+        return None
 
     model_path = resolver_modelo_padrao(model_path)
     tag_modelo, nome_run_modelo = extrair_identificador_modelo(model_path)
     distancia = dist_cm if dist_cm is not None else deduzir_distancia_camera(image_path)
 
-    print(f"\nCarregando modelo YOLO Pose: {model_path} [tag: {tag_modelo}]...")
-    model = YOLO(model_path)
+    if model is None:
+        if verbose:
+            print(f"\nCarregando modelo YOLO Pose: {model_path} [tag: {tag_modelo}]...")
+        model = YOLO(model_path)
 
-    print(f"Processando imagem: {image_path} (Distância: {distancia:.0f} cm | imgsz={imgsz})...")
-    results = model(image_path, conf=conf_thresh, imgsz=imgsz, verbose=False)
+    if verbose:
+        print(f"Processando imagem: {image_path} (Distância: {distancia:.0f} cm | imgsz={imgsz})...")
+
+    # Em modelos YOLO Pose (ex: v4-strict-clean), a confiança da bounding box (box.conf) costuma
+    # saturar em ~0.85-0.88, enquanto a confiança dos keypoints chega a 0.99+.
+    # Para evitar que um --conf alto (ex: 0.95) descarte a caixa no NMS antes de avaliar os keypoints,
+    # buscamos candidatos com limiar base no NMS e validamos conf_thresh na caixa OU nos keypoints.
+    nms_conf = min(float(conf_thresh), 0.25)
+    results = model(image_path, conf=nms_conf, imgsz=imgsz, verbose=False)
 
     if not results or len(results[0]) == 0 or results[0].keypoints is None:
-        print("Nenhum animal detectado na imagem.")
-        return
+        if verbose:
+            print("Nenhum animal detectado na imagem.")
+        return None
 
     result = results[0]
     img = cv2.imread(image_path)
     if img is None:
         print(f"ERRO: Não foi possível carregar a imagem '{image_path}'.")
-        return
+        return None
     h, w = img.shape[:2]
     kpts_data = result.keypoints.data.cpu().numpy()
+    boxes_conf = result.boxes.conf.cpu().numpy() if (result.boxes is not None and result.boxes.conf is not None) else np.ones(len(kpts_data))
 
     dados_validacao = None
     if ground_truth_file and os.path.exists(ground_truth_file):
@@ -437,37 +462,48 @@ def executar_inferencia(image_path, model_path="./runs/pose/onevision-yolo/capri
                 if match_id:
                     dados_validacao = banco.get(int(match_id.group(1)))
         except Exception as e:
-            print(f"Aviso ao ler teste: {e}")
+            if verbose:
+                print(f"Aviso ao ler teste: {e}")
 
     detecoes_validas = []
-    for kpts in kpts_data:
-        confs = [p[2] for p in kpts]
+    for idx_det, kpts in enumerate(kpts_data):
+        confs = [float(p[2]) for p in kpts]
         pts_bons = sum(1 for c in confs if c >= 0.35)
         if pts_bons >= 6:
-            detecoes_validas.append((pts_bons, np.mean(confs), kpts))
+            box_c = float(boxes_conf[idx_det]) if idx_det < len(boxes_conf) else 0.0
+            top6_kpt_c = float(np.mean(sorted(confs, reverse=True)[:6]))
+            # Aceita se a confiança da bounding box OU a média dos 6 melhores keypoints atingir conf_thresh
+            if max(box_c, top6_kpt_c) >= conf_thresh:
+                detecoes_validas.append((pts_bons, np.mean(confs), kpts))
 
     if not detecoes_validas:
-        print("Aviso: Nenhum animal com confiança suficiente nos keypoints foi detectado.")
-        return
+        if verbose:
+            print("Aviso: Nenhum animal com confiança suficiente nos keypoints foi detectado.")
+        return None
 
     detecoes_validas.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
     img_anotada = img.copy()
-    for _, _, kpts in detecoes_validas:
+    estimativas_principal = None
+
+    for idx, (_, _, kpts) in enumerate(detecoes_validas):
         estimativas = estimar_biometria_autonoma(kpts, dist_cm=distancia, img_w=w)
+        if idx == 0:
+            estimativas_principal = estimativas
 
-        print("\n==============================================")
-        print("     PREVISÕES BIOMÉTRICAS AUTÔNOMAS DA IA    ")
-        print("==============================================")
-        print(f" > PESO VIVO PREVISTO:      {estimativas.get('peso_estimado_kg', 0):.2f} kg")
-        print(f" > Altura da Cernelha:      {estimativas.get('altura_cernelha_cm', 0):.1f} cm")
-        print(f" > Altura da Garupa:        {estimativas.get('altura_garupa_cm', 0):.1f} cm")
-        print(f" > Comprimento Corporal:    {estimativas.get('comprimento_cm', 0):.1f} cm")
-        print(f" > Perímetro Torácico:      {estimativas.get('circ_torax_cm', 0):.1f} cm")
-        print(f" > Grossura do Pescoço:     {estimativas.get('grossura_pescoco_cm', 0):.1f} cm")
-        print("==============================================")
+        if verbose:
+            print("\n==============================================")
+            print("     PREVISÕES BIOMÉTRICAS AUTÔNOMAS DA IA    ")
+            print("==============================================")
+            print(f" > PESO VIVO PREVISTO:      {estimativas.get('peso_estimado_kg', 0):.2f} kg")
+            print(f" > Altura da Cernelha:      {estimativas.get('altura_cernelha_cm', 0):.1f} cm")
+            print(f" > Altura da Garupa:        {estimativas.get('altura_garupa_cm', 0):.1f} cm")
+            print(f" > Comprimento Corporal:    {estimativas.get('comprimento_cm', 0):.1f} cm")
+            print(f" > Perímetro Torácico:      {estimativas.get('circ_torax_cm', 0):.1f} cm")
+            print(f" > Grossura do Pescoço:     {estimativas.get('grossura_pescoco_cm', 0):.1f} cm")
+            print("==============================================")
 
-        if dados_validacao:
+        if dados_validacao and verbose:
             metricas_validacao = [
                 ("Peso Vivo", estimativas.get("peso_estimado_kg"), extrair_valor_gabarito(dados_validacao, "peso_kg", "peso", "peso_real_kg"), "kg"),
                 ("Altura Cernelha", estimativas.get("altura_cernelha_cm"), extrair_valor_gabarito(dados_validacao, "altura_cernelha_cm", "cernelha_cm", "altura_cernelha"), "cm"),
@@ -489,13 +525,27 @@ def executar_inferencia(image_path, model_path="./runs/pose/onevision-yolo/capri
                     print(f" > {nome:<20}: Est = {est_v:5.1f} {und} | Real =  N/A")
             print("----------------------------------------------")
 
-        img_anotada = desenhar_painel_onevision(
-            img_anotada, kpts, estimativas, dados_validacao, nome_modelo=f"{nome_run_modelo} ({tag_modelo})"
-        )
+        if save_image:
+            img_anotada = desenhar_painel_onevision(
+                img_anotada, kpts, estimativas, dados_validacao, nome_modelo=f"{nome_run_modelo} ({tag_modelo})"
+            )
 
-    caminho_saida = gerar_caminho_saida_incremental(image_path, tag_modelo, out_dir="outputs")
-    cv2.imwrite(caminho_saida, img_anotada)
-    print(f"\nImagem com esqueleto e biometria salva em: {caminho_saida}")
+    caminho_saida = None
+    if save_image:
+        caminho_saida = gerar_caminho_saida_incremental(image_path, tag_modelo, out_dir="outputs")
+        cv2.imwrite(caminho_saida, img_anotada)
+        if verbose:
+            print(f"\nImagem com esqueleto e biometria salva em: {caminho_saida}")
+
+    return {
+        "image_path": image_path,
+        "estimativas": estimativas_principal,
+        "dados_validacao": dados_validacao,
+        "caminho_saida": caminho_saida,
+        "tag_modelo": tag_modelo,
+        "nome_run_modelo": nome_run_modelo,
+        "distancia_cm": distancia,
+    }
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="OneVision - Estimativa Autônoma de Pose, Biometria e Peso de Caprinos")
