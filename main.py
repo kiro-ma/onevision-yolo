@@ -317,15 +317,63 @@ def estimar_biometria_autonoma(kpts, dist_cm=160.0, img_w=4080.0):
 
     return estimativas
 
-def desenhar_painel_onevision(img, kpts, estimativas, dados_validacao=None, nome_modelo=None):
-    """Desenha o esqueleto e o painel biométrico com validação completa real vs estimado e identificação do modelo."""
+def desenhar_painel_onevision(img, kpts, estimativas, dados_validacao=None, nome_modelo=None, bbox=None, box_conf=None):
+    """Desenha a bounding box, o esqueleto e o painel biométrico com validação completa real vs estimado e identificação do modelo."""
     h, w = img.shape[:2]
     escala = max(w, h) / 2000.0
     line_thick = max(2, int(4 * escala))
     radius = max(4, int(7 * escala))
     font_scale = 0.50 * escala
 
-    # 1. Desenha as conexões do esqueleto
+    # 0. Calcula as dimensões do painel lateral antes de desenhar para evitar que a etiqueta da bbox fique sob o painel
+    painel_w = int(520 * escala)
+    espaco_linha = int(28 * escala)
+    pad = int(25 * escala)
+
+    # 1. Desenha a bounding box ao redor do animal inferido
+    if bbox is not None and len(bbox) >= 4:
+        bx1, by1, bx2, by2 = [int(round(v)) for v in bbox[:4]]
+        bx1, by1 = max(0, bx1), max(0, by1)
+        bx2, by2 = min(w - 1, bx2), min(h - 1, by2)
+        cor_bbox = (0, 200, 255)  # Dourado/laranja consistente com a borda do painel OneVision
+        espessura_bbox = max(2, int(3 * escala))
+        cv2.rectangle(img, (bx1, by1), (bx2, by2), cor_bbox, espessura_bbox, cv2.LINE_AA)
+
+        texto_bbox = f"Animal ({box_conf * 100:.1f}%)" if box_conf is not None else "Animal"
+        font_bbox = font_scale * 0.90
+        thick_txt_bbox = max(1, int(1.3 * escala))
+        (tw, th), baseline = cv2.getTextSize(texto_bbox, cv2.FONT_HERSHEY_SIMPLEX, font_bbox, thick_txt_bbox)
+        pad_x = max(4, int(8 * escala))
+        pad_y = max(3, int(6 * escala))
+        tag_h = th + baseline + 2 * pad_y
+        tag_w = tw + 2 * pad_x
+
+        # Posiciona a etiqueta acima da caixa (ou dentro, caso encoste no topo da imagem)
+        if by1 - tag_h >= 0:
+            ty1, ty2 = by1 - tag_h, by1
+            y_texto = by1 - pad_y - baseline // 2
+        else:
+            ty1, ty2 = by1, min(h - 1, by1 + tag_h)
+            y_texto = ty1 + th + pad_y
+
+        # Se o canto superior esquerdo da bbox estiver na área do painel (canto superior esquerdo da imagem),
+        # alinha a etiqueta no canto superior direito da bbox para não ficar coberta pelo painel.
+        limite_painel_x = pad + painel_w + int(15 * escala)
+        limite_painel_y = pad + int(450 * escala)
+        if bx1 < limite_painel_x and ty1 < limite_painel_y and (bx2 - tag_w) >= limite_painel_x:
+            tx2 = bx2
+            tx1 = max(0, bx2 - tag_w)
+        else:
+            tx1 = bx1
+            tx2 = min(w - 1, bx1 + tag_w)
+
+        cv2.rectangle(img, (tx1, ty1), (tx2, ty2), cor_bbox, -1)
+        cv2.putText(
+            img, texto_bbox, (tx1 + pad_x, y_texto),
+            cv2.FONT_HERSHEY_SIMPLEX, font_bbox, (20, 20, 20), thick_txt_bbox, cv2.LINE_AA
+        )
+
+    # 2. Desenha as conexões do esqueleto
     for grupo in SKELETON_GROUPS:
         cor = grupo["color"]
         for p1, p2 in grupo["pairs"]:
@@ -381,10 +429,7 @@ def desenhar_painel_onevision(img, kpts, estimativas, dados_validacao=None, nome
                 linhas.append((f"{label}: Real {real_v:.1f}{und} | Diff {diff:.1f}{und}", (200, 220, 255)))
 
     # Dimensionamento dinâmico da caixa do painel com base na quantidade de linhas
-    painel_w = int(520 * escala)
-    espaco_linha = int(28 * escala)
     painel_h = int((35 * escala) + (len(linhas) * espaco_linha))
-    pad = int(25 * escala)
 
     overlay = img.copy()
     cv2.rectangle(overlay, (pad, pad), (pad + painel_w, pad + painel_h), (25, 25, 25), -1)
@@ -404,8 +449,11 @@ def resolver_modelo_padrao(caminho_preferido="./runs/pose/onevision-yolo/caprine
     candidatos = [
         caminho_preferido,
         "./runs/pose/onevision-yolo/caprine-bovidae-v4-strict-clean/weights/best.pt",
+        "./runs/pose/caprine-bovidae-v4-strict-clean/weights/best.pt",
         "./runs/pose/onevision-yolo/caprine-bovidae-v2-oclusao/weights/best.pt",
+        "./runs/pose/caprine-bovidae-v2-oclusao/weights/best.pt",
         "./runs/pose/onevision-yolo/caprine-bovidae-v1/weights/best.pt",
+        "./runs/pose/caprine-bovidae-v1/weights/best.pt",
     ]
     for c in candidatos:
         if os.path.exists(c):
@@ -452,6 +500,7 @@ def executar_inferencia(image_path, model_path="./runs/pose/onevision-yolo/capri
     h, w = img.shape[:2]
     kpts_data = result.keypoints.data.cpu().numpy()
     boxes_conf = result.boxes.conf.cpu().numpy() if (result.boxes is not None and result.boxes.conf is not None) else np.ones(len(kpts_data))
+    boxes_xyxy = result.boxes.xyxy.cpu().numpy() if (result.boxes is not None and result.boxes.xyxy is not None) else None
 
     dados_validacao = None
     if ground_truth_file and os.path.exists(ground_truth_file):
@@ -471,10 +520,11 @@ def executar_inferencia(image_path, model_path="./runs/pose/onevision-yolo/capri
         pts_bons = sum(1 for c in confs if c >= 0.35)
         if pts_bons >= 6:
             box_c = float(boxes_conf[idx_det]) if idx_det < len(boxes_conf) else 0.0
+            box_coords = boxes_xyxy[idx_det] if (boxes_xyxy is not None and idx_det < len(boxes_xyxy)) else None
             top6_kpt_c = float(np.mean(sorted(confs, reverse=True)[:6]))
             # Aceita se a confiança da bounding box OU a média dos 6 melhores keypoints atingir conf_thresh
             if max(box_c, top6_kpt_c) >= conf_thresh:
-                detecoes_validas.append((pts_bons, np.mean(confs), kpts))
+                detecoes_validas.append((pts_bons, np.mean(confs), kpts, box_coords, box_c))
 
     if not detecoes_validas:
         if verbose:
@@ -486,7 +536,7 @@ def executar_inferencia(image_path, model_path="./runs/pose/onevision-yolo/capri
     img_anotada = img.copy()
     estimativas_principal = None
 
-    for idx, (_, _, kpts) in enumerate(detecoes_validas):
+    for idx, (_, _, kpts, box_coords, box_c) in enumerate(detecoes_validas):
         estimativas = estimar_biometria_autonoma(kpts, dist_cm=distancia, img_w=w)
         if idx == 0:
             estimativas_principal = estimativas
@@ -527,7 +577,9 @@ def executar_inferencia(image_path, model_path="./runs/pose/onevision-yolo/capri
 
         if save_image:
             img_anotada = desenhar_painel_onevision(
-                img_anotada, kpts, estimativas, dados_validacao, nome_modelo=f"{nome_run_modelo} ({tag_modelo})"
+                img_anotada, kpts, estimativas, dados_validacao,
+                nome_modelo=f"{nome_run_modelo} ({tag_modelo})",
+                bbox=box_coords, box_conf=box_c
             )
 
     caminho_saida = None
