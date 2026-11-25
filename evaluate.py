@@ -1,7 +1,11 @@
 import os
 import re
+import csv
 import json
 import argparse
+from datetime import datetime
+from typing import Any, Optional
+
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -87,6 +91,27 @@ def gerar_caminho_unico(out_dir: str, nome_base: str, ext: str) -> str:
         contador += 1
 
 
+def criar_diretorio_execucao(base_out_dir: str, tag_modelo: str) -> tuple[str, str]:
+    """
+    Cria um subdiretório exclusivo dentro de base_out_dir (ex: outputs/evaluation/run_YYYYMMDD_HHMMSS_<tag>/)
+    garantindo isolamento total entre execuções sem sobrescrever artefatos anteriores.
+    """
+    os.makedirs(base_out_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id_base = f"run_{timestamp}_{tag_modelo}"
+    caminho_run = os.path.join(base_out_dir, run_id_base)
+
+    contador = 1
+    run_id = run_id_base
+    while os.path.exists(caminho_run):
+        run_id = f"{run_id_base}_{contador}"
+        caminho_run = os.path.join(base_out_dir, run_id)
+        contador += 1
+
+    os.makedirs(caminho_run, exist_ok=True)
+    return caminho_run, run_id
+
+
 def resolver_medidas_selecionadas(measure_arg: str) -> list[str]:
     """Resolve o argumento --measure (ex: 'peso', 'altura', 'all') para chaves canônicas de MEASURES_CONFIG."""
     arg_limpo = measure_arg.strip().lower()
@@ -130,6 +155,9 @@ def filtrar_imagens_com_gabarito(inputs_dir: str, banco_gt: dict[int, dict]) -> 
 
     imagens_validas = []
     for nome_arq in sorted(os.listdir(inputs_dir)):
+        caminho_completo = os.path.join(inputs_dir, nome_arq)
+        if not os.path.isfile(caminho_completo):
+            continue
         if not nome_arq.lower().endswith(VALID_IMAGE_EXTENSIONS):
             continue
 
@@ -139,7 +167,6 @@ def filtrar_imagens_com_gabarito(inputs_dir: str, banco_gt: dict[int, dict]) -> 
 
         id_animal = int(match_id.group(1))
         if id_animal in banco_gt:
-            caminho_completo = os.path.join(inputs_dir, nome_arq)
             imagens_validas.append((caminho_completo, id_animal, banco_gt[id_animal]))
 
     return imagens_validas
@@ -168,6 +195,7 @@ def calcular_metricas_medida(registros: list[dict], measure_key: str) -> dict:
                 "label_curto": os.path.splitext(os.path.basename(reg["image_path"]))[0],
                 "id_animal": reg["id_animal"],
                 "identificacao": gt_dict.get("identificacao", f"ID {reg['id_animal']}"),
+                "distancia_usada_cm": reg.get("distancia_cm"),
                 "real": float(val_real),
                 "inferido": float(val_pred),
                 "erro_abs": float(erro_abs),
@@ -209,13 +237,71 @@ def calcular_metricas_medida(registros: list[dict], measure_key: str) -> dict:
     }
 
 
-def gerar_grafico_medida(metrica_info: dict, nome_modelo: str, tag_modelo: str, out_dir: str, plot_type: str = "both") -> str:
+def _formatar_texto_parametros(parametros: dict[str, Any]) -> str:
+    """Formata o bloco padronizado de parâmetros da execução para exibição no cabeçalho/rodapé dos gráficos PNG."""
+    dist_info = (
+        f"Fixa ({parametros['dist_cm']:.0f} cm)"
+        if parametros.get("dist_cm") is not None
+        else "Automática (extraída de 'dist<N>' no nome da imagem; fallback 160 cm)"
+    )
+    medidas_labels = [
+        MEASURES_CONFIG[m]["label"] if m in MEASURES_CONFIG else m
+        for m in parametros.get("medidas_selecionadas", [])
+    ]
+    poses_info = (
+        f"Sim ({parametros.get('poses_dir', parametros.get('run_dir'))})"
+        if parametros.get("save_poses")
+        else "Não"
+    )
+
+    return (
+        f"PARÂMETROS DA EXECUÇÃO ({parametros.get('run_id', '-')})   |   Data/Hora: {parametros.get('timestamp', '-')}\n"
+        f"• Modelo / Pesos : {parametros.get('model_path')}  [run: {parametros.get('modelo_nome')} | tag: {parametros.get('modelo_tag')}]\n"
+        f"• Inferência YOLO: conf={parametros.get('conf')} | imgsz={parametros.get('imgsz')} | Distância Câmera: {dist_info} | Calibração Focal: {pipeline.FOCAL_CALIBRATION_CONSTANT:.0f} (Base W={pipeline.BASE_IMAGE_WIDTH:.0f}px)\n"
+        f"• Dados & Filtros: inputs='{parametros.get('inputs_dir')}/' | gabarito='{parametros.get('gt_file')}' | Imagens válidas: {parametros.get('n_inferencias_validas', 0)}/{parametros.get('n_imagens_com_gt', 0)} "
+        f"| plot_type='{parametros.get('plot_type')}' | save_poses={poses_info}\n"
+        f"• Medidas (--measure='{parametros.get('measure_arg')}'): {', '.join(medidas_labels)}"
+    )
+
+
+def _adicionar_painel_parametros_figura(fig: plt.Figure, parametros: Optional[dict[str, Any]]) -> None:
+    """Adiciona uma caixa estilizada com todos os parâmetros da execução na base da figura."""
+    if not parametros:
+        return
+
+    texto_param = _formatar_texto_parametros(parametros)
+    fig.text(
+        0.012,
+        0.012,
+        texto_param,
+        fontsize=8.2,
+        va="bottom",
+        ha="left",
+        family="monospace",
+        bbox={
+            "boxstyle": "round,pad=0.50",
+            "facecolor": "#f4f7fa",
+            "edgecolor": "#2b8cbe",
+            "linewidth": 1.2,
+        },
+    )
+
+
+def gerar_grafico_medida(
+    metrica_info: dict,
+    nome_modelo: str,
+    tag_modelo: str,
+    out_dir: str,
+    plot_type: str = "both",
+    parametros: Optional[dict[str, Any]] = None,
+) -> str:
     """
     Gera e salva o gráfico comparando Valor Real vs Valor Inferido (Scatter Plot e/ou Barras Emparelhadas),
-    incluindo obrigatoriamente no título e na legenda:
-      - Nome do modelo utilizado
+    incluindo obrigatoriamente no título, legenda e painel de metadados:
+      - Nome do modelo utilizado e identificador da run
       - Nome da medida avaliada
-      - Porcentagem de acerto final (Acurácia = 100% - MAPE)
+      - Porcentagem de acerto final (Acurácia = 100% - MAPE), MAPE, MAE e RMSE
+      - Todos os parâmetros de configuração utilizados na execução
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -230,31 +316,32 @@ def gerar_grafico_medida(metrica_info: dict, nome_modelo: str, tag_modelo: str, 
     acuracia = metrica_info["acuracia"]
     mape = metrica_info["mape"]
     mae = metrica_info["mae"]
+    rmse = metrica_info["rmse"]
     measure_key = metrica_info["measure_key"]
+    n_amostras = metrica_info["n_amostras"]
 
     reais = np.array([a["real"] for a in amostras])
     inferidos = np.array([a["inferido"] for a in amostras])
     labels_x = [a["label_curto"] for a in amostras]
 
+    run_id_str = f" | Run: {parametros['run_id']}" if (parametros and parametros.get("run_id")) else ""
     titulo_principal = (
-        f"Avaliação Biométrica: {label_medida} ({unidade})\n"
-        f"Modelo: {nome_modelo} [{tag_modelo}] | Acurácia Final: {acuracia:.2f}% (MAPE: {mape:.2f}% | MAE: {mae:.2f} {unidade})"
+        f"Avaliação Biométrica: {label_medida} ({unidade}){run_id_str}\n"
+        f"Modelo: {nome_modelo} [{tag_modelo}] | Acurácia Final: {acuracia:.2f}% "
+        f"(MAPE: {mape:.2f}% | MAE: {mae:.2f} {unidade} | RMSE: {rmse:.2f} {unidade} | N={n_amostras})"
     )
     legenda_identificacao = f"{nome_modelo} | {label_medida} | Acerto: {acuracia:.2f}%"
 
     if plot_type == "scatter":
-        fig, ax_scatter = plt.subplots(figsize=(9, 7), dpi=150)
-        axes_list = [ax_scatter]
+        fig, ax_scatter = plt.subplots(figsize=(10.5, 8.2), dpi=150)
     elif plot_type == "bars":
-        fig, ax_bars = plt.subplots(figsize=(max(12, len(amostras) * 0.45), 7), dpi=150)
-        axes_list = [ax_bars]
+        fig, ax_bars = plt.subplots(figsize=(max(12.5, len(amostras) * 0.45), 8.2), dpi=150)
     else:
         fig, (ax_scatter, ax_bars) = plt.subplots(
-            1, 2, figsize=(18, 7.5), dpi=150, gridspec_kw={"width_ratios": [1.0, 1.35]}
+            1, 2, figsize=(18.5, 8.6), dpi=150, gridspec_kw={"width_ratios": [1.0, 1.35]}
         )
-        axes_list = [ax_scatter, ax_bars]
 
-    fig.suptitle(titulo_principal, fontsize=13, fontweight="bold", y=0.98)
+    fig.suptitle(titulo_principal, fontsize=12.5, fontweight="bold", y=0.985)
 
     # 1. Gráfico de Dispersão (Scatter Plot: Valor Real vs Valor Inferido)
     if plot_type in ("scatter", "both"):
@@ -294,7 +381,7 @@ def gerar_grafico_medida(metrica_info: dict, nome_modelo: str, tag_modelo: str, 
         ax_scatter.set_xlim(min_v, max_v)
         ax_scatter.set_ylim(min_v, max_v)
         ax_scatter.set_title(
-            f"Dispersão: Real vs Inferido — {label_medida}\nModelo: {tag_modelo} | Acerto: {acuracia:.2f}%",
+            f"Dispersão: Real vs Inferido — {label_medida}\nModelo: {tag_modelo} | Acerto: {acuracia:.2f}% (MAE: {mae:.2f} {unidade})",
             fontsize=11,
             fontweight="semibold",
         )
@@ -328,7 +415,7 @@ def gerar_grafico_medida(metrica_info: dict, nome_modelo: str, tag_modelo: str, 
         )
 
         ax_bars.set_title(
-            f"Barras Emparelhadas por Imagem — {label_medida}\nModelo: {tag_modelo} | Acerto: {acuracia:.2f}%",
+            f"Barras Emparelhadas por Imagem — {label_medida}\nModelo: {tag_modelo} | Acerto: {acuracia:.2f}% (MAPE: {mape:.2f}%)",
             fontsize=11,
             fontweight="semibold",
         )
@@ -339,17 +426,28 @@ def gerar_grafico_medida(metrica_info: dict, nome_modelo: str, tag_modelo: str, 
         ax_bars.legend(loc="upper right", fontsize=8.5, frameon=True)
         ax_bars.grid(True, axis="y", linestyle=":", alpha=0.6)
 
-    plt.tight_layout(rect=[0, 0, 1, 0.92])
+    _adicionar_painel_parametros_figura(fig, parametros)
+    rect_bottom = 0.145 if parametros else 0.0
+    plt.tight_layout(rect=[0, rect_bottom, 1, 0.915])
 
     caminho_grafico = gerar_caminho_unico(out_dir, f"eval_{tag_modelo}_{measure_key}", ".png")
-    fig.savefig(caminho_grafico, dpi=150)
+    fig.savefig(caminho_grafico, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
     return caminho_grafico
 
 
-def gerar_grafico_resumo_geral(resultados_medidas: list[dict], nome_modelo: str, tag_modelo: str, out_dir: str) -> str:
-    """Gera um gráfico de resumo com a Porcentagem de Acerto (Acurácia) de todas as medidas avaliadas."""
+def gerar_grafico_resumo_geral(
+    resultados_medidas: list[dict],
+    nome_modelo: str,
+    tag_modelo: str,
+    out_dir: str,
+    parametros: Optional[dict[str, Any]] = None,
+) -> str:
+    """
+    Gera um gráfico de resumo com a Porcentagem de Acerto (Acurácia), MAPE, MAE e RMSE
+    de todas as medidas avaliadas, acompanhado de todos os parâmetros da execução.
+    """
     validas = [m for m in resultados_medidas if m["acuracia"] is not None]
     if len(validas) < 2:
         return ""
@@ -358,9 +456,12 @@ def gerar_grafico_resumo_geral(resultados_medidas: list[dict], nome_modelo: str,
     nomes = [m["label"] for m in validas]
     acuracias = [m["acuracia"] for m in validas]
     mapes = [m["mape"] for m in validas]
+    maes = [m["mae"] for m in validas]
+    unidades = [m["unit"] for m in validas]
     media_global = float(np.mean(acuracias))
+    mape_medio_global = float(np.mean(mapes))
 
-    fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
+    fig, ax = plt.subplots(figsize=(13.5, 7.8), dpi=150)
     x_idx = np.arange(len(validas))
     cores = ["#2b8cbe" if ac >= 80 else "#fdae6b" if ac >= 65 else "#de2d26" for ac in acuracias]
 
@@ -370,40 +471,166 @@ def gerar_grafico_resumo_geral(resultados_medidas: list[dict], nome_modelo: str,
         color=cores,
         edgecolor="black",
         width=0.55,
-        label=f"Modelo: {nome_modelo} ({tag_modelo}) | Acurácia Média Global: {media_global:.2f}%",
+        label=(
+            f"Modelo: {nome_modelo} ({tag_modelo}) | "
+            f"Acurácia Média Global: {media_global:.2f}% (MAPE Médio: {mape_medio_global:.2f}%)"
+        ),
     )
 
-    for bar, ac, mp in zip(barras, acuracias, mapes):
+    for bar, ac, mp, mae_v, und in zip(barras, acuracias, mapes, maes, unidades):
         altura = bar.get_height()
         ax.text(
             bar.get_x() + bar.get_width() / 2.0,
             altura + 1.2,
-            f"{ac:.1f}%\n(MAPE {mp:.1f}%)",
+            f"{ac:.1f}%\n(MAPE {mp:.1f}% | MAE {mae_v:.1f}{und})",
             ha="center",
             va="bottom",
-            fontsize=8.5,
+            fontsize=8.2,
             fontweight="bold",
         )
 
-    ax.set_ylim(0, 112)
+    run_id_str = f" | Run: {parametros['run_id']}" if (parametros and parametros.get("run_id")) else ""
+    ax.set_ylim(0, 115)
     ax.axhline(media_global, color="#d62728", linestyle="--", linewidth=1.8, label=f"Média Global: {media_global:.2f}%")
     ax.set_xticks(x_idx)
-    ax.set_xticklabels(nomes, rotation=20, ha="right", fontsize=9.5)
+    ax.set_xticklabels(nomes, rotation=18, ha="right", fontsize=9.5)
     ax.set_ylabel("Porcentagem de Acerto / Acurácia (%)", fontsize=10)
     ax.set_title(
-        f"Resumo Geral de Acurácia por Medida Biométrica\n"
-        f"Modelo: {nome_modelo} [{tag_modelo}] | Acerto Médio Global: {media_global:.2f}%",
+        f"Resumo Geral de Acurácia por Medida Biométrica{run_id_str}\n"
+        f"Modelo: {nome_modelo} [{tag_modelo}] | Acerto Médio Global: {media_global:.2f}% (MAPE Médio: {mape_medio_global:.2f}%)",
         fontsize=12,
         fontweight="bold",
     )
     ax.legend(loc="upper right", fontsize=9, frameon=True)
     ax.grid(True, axis="y", linestyle=":", alpha=0.6)
 
-    plt.tight_layout()
+    _adicionar_painel_parametros_figura(fig, parametros)
+    rect_bottom = 0.175 if parametros else 0.0
+    plt.tight_layout(rect=[0, rect_bottom, 1, 0.96])
+
     caminho_resumo = gerar_caminho_unico(out_dir, f"eval_{tag_modelo}_resumo_todas_medidas", ".png")
-    fig.savefig(caminho_resumo, dpi=150)
+    fig.savefig(caminho_resumo, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return caminho_resumo
+
+
+def salvar_csv_avaliacao(
+    run_dir: str,
+    tag_modelo: str,
+    sufixo_medida: str,
+    parametros: dict[str, Any],
+    resultados_finais: list[dict],
+) -> tuple[str, str]:
+    """
+    Salva dois arquivos CSV na pasta da execução contendo todos os parâmetros e métricas:
+      1. CSV de resumo por medida (com colunas de parâmetros da run + MAE, RMSE, MAPE, Acurácia)
+      2. CSV detalhado por amostra/imagem e medida avaliada (com parâmetros da run + Real, Inferido, Erros)
+    """
+    caminho_csv_resumo = gerar_caminho_unico(run_dir, f"resumo_metricas_{tag_modelo}_{sufixo_medida}", ".csv")
+    caminho_csv_amostras = gerar_caminho_unico(run_dir, f"detalhe_amostras_{tag_modelo}_{sufixo_medida}", ".csv")
+
+    campos_resumo = [
+        "run_id",
+        "timestamp",
+        "modelo_nome",
+        "modelo_tag",
+        "model_path",
+        "conf",
+        "imgsz",
+        "dist_cm_fixa",
+        "inputs_dir",
+        "gt_file",
+        "plot_type",
+        "save_poses",
+        "measure_arg",
+        "measure_key",
+        "measure_label",
+        "unit",
+        "n_amostras",
+        "mae",
+        "rmse",
+        "mape_pct",
+        "acuracia_pct",
+    ]
+
+    with open(caminho_csv_resumo, "w", encoding="utf-8", newline="") as f_res:
+        writer = csv.DictWriter(f_res, fieldnames=campos_resumo)
+        writer.writeheader()
+        for info in resultados_finais:
+            writer.writerow({
+                "run_id": parametros["run_id"],
+                "timestamp": parametros["timestamp"],
+                "modelo_nome": parametros["modelo_nome"],
+                "modelo_tag": parametros["modelo_tag"],
+                "model_path": parametros["model_path"],
+                "conf": parametros["conf"],
+                "imgsz": parametros["imgsz"],
+                "dist_cm_fixa": parametros["dist_cm"] if parametros["dist_cm"] is not None else "auto_filename",
+                "inputs_dir": parametros["inputs_dir"],
+                "gt_file": parametros["gt_file"],
+                "plot_type": parametros["plot_type"],
+                "save_poses": parametros["save_poses"],
+                "measure_arg": parametros["measure_arg"],
+                "measure_key": info["measure_key"],
+                "measure_label": info["label"],
+                "unit": info["unit"],
+                "n_amostras": info["n_amostras"],
+                "mae": round(info["mae"], 4) if info["mae"] is not None else None,
+                "rmse": round(info["rmse"], 4) if info["rmse"] is not None else None,
+                "mape_pct": round(info["mape"], 4) if info["mape"] is not None else None,
+                "acuracia_pct": round(info["acuracia"], 4) if info["acuracia"] is not None else None,
+            })
+
+    campos_amostras = [
+        "run_id",
+        "timestamp",
+        "modelo_nome",
+        "modelo_tag",
+        "conf",
+        "imgsz",
+        "dist_cm_config",
+        "imagem",
+        "id_animal",
+        "identificacao",
+        "distancia_usada_cm",
+        "measure_key",
+        "measure_label",
+        "unit",
+        "real",
+        "inferido",
+        "erro_abs",
+        "erro_pct",
+        "acerto_pct",
+    ]
+
+    with open(caminho_csv_amostras, "w", encoding="utf-8", newline="") as f_am:
+        writer = csv.DictWriter(f_am, fieldnames=campos_amostras)
+        writer.writeheader()
+        for info in resultados_finais:
+            for am in info["amostras"]:
+                writer.writerow({
+                    "run_id": parametros["run_id"],
+                    "timestamp": parametros["timestamp"],
+                    "modelo_nome": parametros["modelo_nome"],
+                    "modelo_tag": parametros["modelo_tag"],
+                    "conf": parametros["conf"],
+                    "imgsz": parametros["imgsz"],
+                    "dist_cm_config": parametros["dist_cm"] if parametros["dist_cm"] is not None else "auto_filename",
+                    "imagem": am["imagem"],
+                    "id_animal": am["id_animal"],
+                    "identificacao": am["identificacao"],
+                    "distancia_usada_cm": am.get("distancia_usada_cm"),
+                    "measure_key": info["measure_key"],
+                    "measure_label": info["label"],
+                    "unit": info["unit"],
+                    "real": round(am["real"], 4),
+                    "inferido": round(am["inferido"], 4),
+                    "erro_abs": round(am["erro_abs"], 4),
+                    "erro_pct": round(am["erro_pct"], 4),
+                    "acerto_pct": round(am["acerto_pct"], 4),
+                })
+
+    return caminho_csv_resumo, caminho_csv_amostras
 
 
 def executar_avaliacao(
@@ -414,30 +641,42 @@ def executar_avaliacao(
     inputs_dir: str = "inputs",
     gt_file: str = "dados_biometria.json",
     out_dir: str = "outputs/evaluation",
-    dist_cm: float = None,
+    dist_cm: Optional[float] = None,
     save_annotated_images: bool = False,
     plot_type: str = "both",
-):
+) -> Optional[dict[str, Any]]:
     medidas_selecionadas = resolver_medidas_selecionadas(measure)
     banco_gt = carregar_ground_truth(gt_file)
     imagens_filtradas = filtrar_imagens_com_gabarito(inputs_dir, banco_gt)
 
     if not imagens_filtradas:
         print(f"Nenhuma imagem na pasta '{inputs_dir}' possui correspondência no arquivo '{gt_file}'.")
-        return
+        return None
 
     model_resolvido = pipeline.resolver_modelo_padrao(model_path)
     tag_modelo, nome_run_modelo = pipeline.extrair_identificador_modelo(model_resolvido)
 
-    print("=" * 72)
-    print("         ONEVISION - AVALIAÇÃO E VALIDAÇÃO DE MODELOS BIOMÉTRICOS       ")
-    print("=" * 72)
+    # Cria subpasta exclusiva da execução dentro de outputs/evaluation/
+    run_dir, run_id = criar_diretorio_execucao(out_dir, tag_modelo)
+    timestamp_exec = datetime.now().isoformat(timespec="seconds")
+    poses_dir = os.path.join(run_dir, "poses") if save_annotated_images else None
+
+    dist_desc = f"{dist_cm:.0f} cm (fixa via --dist)" if dist_cm is not None else "Automática (extraída do nome do arquivo)"
+
+    print("=" * 88)
+    print("             ONEVISION - AVALIAÇÃO E VALIDAÇÃO DE MODELOS BIOMÉTRICOS             ")
+    print("=" * 88)
+    print(f" > Execução (Run ID)  : {run_id}")
+    print(f" > Pasta da Execução  : {run_dir}")
+    print(f" > Data / Hora        : {timestamp_exec}")
     print(f" > Modelo Selecionado : {model_resolvido}")
     print(f" > Identificador Run  : {nome_run_modelo} [tag: {tag_modelo}]")
     print(f" > Parâmetros YOLO    : conf={conf_thresh} | imgsz={imgsz}")
-    print(f" > Imagens com GT     : {len(imagens_filtradas)} encontradas em '{inputs_dir}/'")
-    print(f" > Medidas Avaliadas  : {', '.join(medidas_selecionadas)}")
-    print("=" * 72)
+    print(f" > Distância Câmera   : {dist_desc}")
+    print(f" > Fonte de Dados     : inputs='{inputs_dir}/' | gabarito='{gt_file}' ({len(imagens_filtradas)} imagens c/ GT)")
+    print(f" > Medidas Avaliadas  : {', '.join(medidas_selecionadas)} (--measure='{measure}')")
+    print(f" > Opções Gráficas    : plot_type='{plot_type}' | save_poses={save_annotated_images}")
+    print("=" * 88)
 
     # Carrega o modelo YOLO uma única vez para otimizar a inferência em lote
     modelo_yolo = YOLO(model_resolvido)
@@ -461,11 +700,23 @@ def executar_avaliacao(
             verbose=False,
         )
 
+        # Caso --save-poses esteja ativo, move a imagem gerada para a subpasta poses/ da própria run
+        if save_annotated_images and resultado and resultado.get("caminho_saida") and poses_dir:
+            os.makedirs(poses_dir, exist_ok=True)
+            origem_pose = resultado["caminho_saida"]
+            if os.path.exists(origem_pose):
+                destino_pose = os.path.join(poses_dir, os.path.basename(origem_pose))
+                os.replace(origem_pose, destino_pose)
+                resultado["caminho_saida"] = destino_pose
+
         if resultado and resultado.get("estimativas"):
-            print("OK")
+            dist_usada = resultado.get("distancia_cm")
+            print(f"OK (dist={dist_usada:.0f}cm)" if dist_usada is not None else "OK")
             registros_inferencia.append({
                 "image_path": img_path,
                 "id_animal": id_animal,
+                "distancia_cm": dist_usada,
+                "caminho_pose": resultado.get("caminho_saida"),
                 "estimativas": resultado["estimativas"],
                 "gt": gt_item,
             })
@@ -473,17 +724,41 @@ def executar_avaliacao(
             print("FALHA (animal/keypoints insuficientes)")
             falhas_deteccao.append(nome_img)
 
-    print("\n" + "=" * 72)
-    print(f"               RESULTADOS CONSOLIDADOS ({nome_run_modelo})               ")
-    print("=" * 72)
+    parametros_exec = {
+        "run_id": run_id,
+        "timestamp": timestamp_exec,
+        "model_path": model_resolvido,
+        "modelo_nome": nome_run_modelo,
+        "modelo_tag": tag_modelo,
+        "conf": conf_thresh,
+        "imgsz": imgsz,
+        "dist_cm": dist_cm,
+        "measure_arg": measure,
+        "medidas_selecionadas": medidas_selecionadas,
+        "inputs_dir": inputs_dir,
+        "gt_file": gt_file,
+        "base_out_dir": out_dir,
+        "run_dir": run_dir,
+        "poses_dir": poses_dir,
+        "plot_type": plot_type,
+        "save_poses": save_annotated_images,
+        "focal_calibration_constant": pipeline.FOCAL_CALIBRATION_CONSTANT,
+        "base_image_width": pipeline.BASE_IMAGE_WIDTH,
+        "n_imagens_com_gt": len(imagens_filtradas),
+        "n_inferencias_validas": len(registros_inferencia),
+        "n_falhas_deteccao": len(falhas_deteccao),
+    }
+
+    print("\n" + "=" * 88)
+    print(f"               RESULTADOS CONSOLIDADOS ({nome_run_modelo} | {run_id})               ")
+    print("=" * 88)
     print(f" Imagens processadas com sucesso: {len(registros_inferencia)}/{len(imagens_filtradas)}")
     if falhas_deteccao:
         print(f" Imagens sem detecção válida ({len(falhas_deteccao)}): {', '.join(falhas_deteccao)}")
-    print("-" * 72)
-    print(f"{'Medida Biométrica':<24} | {'Amostras':<8} | {'MAE':<10} | {'MAPE (%)':<10} | {'Acerto (%)'}")
-    print("-" * 72)
+    print("-" * 88)
+    print(f"{'Medida Biométrica':<24} | {'Amostras':<8} | {'MAE':<11} | {'RMSE':<11} | {'MAPE (%)':<10} | {'Acerto (%)'}")
+    print("-" * 88)
 
-    os.makedirs(out_dir, exist_ok=True)
     resultados_finais = []
     graficos_salvos = []
 
@@ -495,39 +770,73 @@ def executar_avaliacao(
             und = info["unit"]
             print(
                 f"{info['label']:<24} | {info['n_amostras']:<8d} | "
-                f"{info['mae']:6.2f} {und:<3} | {info['mape']:8.2f}%  | {info['acuracia']:8.2f}%"
+                f"{info['mae']:6.2f} {und:<4} | {info['rmse']:6.2f} {und:<4} | "
+                f"{info['mape']:8.2f}%  | {info['acuracia']:8.2f}%"
             )
             caminho_fig = gerar_grafico_medida(
                 metrica_info=info,
                 nome_modelo=nome_run_modelo,
                 tag_modelo=tag_modelo,
-                out_dir=out_dir,
+                out_dir=run_dir,
                 plot_type=plot_type,
+                parametros=parametros_exec,
             )
             graficos_salvos.append(caminho_fig)
         else:
-            print(f"{info['label']:<24} | {'0':<8} | {'N/A':<10} | {'N/A':<10} | {'N/A'}")
+            print(f"{info['label']:<24} | {'0':<8} | {'N/A':<11} | {'N/A':<11} | {'N/A':<10} | {'N/A'}")
 
-    print("=" * 72)
+    print("=" * 88)
 
     if len(medidas_selecionadas) > 1:
-        caminho_resumo = gerar_grafico_resumo_geral(resultados_finais, nome_run_modelo, tag_modelo, out_dir)
+        caminho_resumo = gerar_grafico_resumo_geral(
+            resultados_medidas=resultados_finais,
+            nome_modelo=nome_run_modelo,
+            tag_modelo=tag_modelo,
+            out_dir=run_dir,
+            parametros=parametros_exec,
+        )
         if caminho_resumo:
             graficos_salvos.append(caminho_resumo)
 
-    # Salva também um relatório JSON detalhado na pasta de avaliação sem sobrescrever existentes
     sufixo_medida = "all" if len(medidas_selecionadas) > 1 else medidas_selecionadas[0]
-    relatorio_json_path = gerar_caminho_unico(out_dir, f"relatorio_{tag_modelo}_{sufixo_medida}", ".json")
+
+    # Salva CSVs de resumo e de amostras detalhadas dentro da pasta exclusiva da run
+    csv_resumo_path, csv_amostras_path = salvar_csv_avaliacao(
+        run_dir=run_dir,
+        tag_modelo=tag_modelo,
+        sufixo_medida=sufixo_medida,
+        parametros=parametros_exec,
+        resultados_finais=resultados_finais,
+    )
+
+    # Salva relatório JSON detalhado na pasta exclusiva da run com todos os parâmetros utilizados
+    acuracias_validas = [m["acuracia"] for m in resultados_finais if m["acuracia"] is not None]
+    mapes_validos = [m["mape"] for m in resultados_finais if m["mape"] is not None]
+
+    relatorio_json_path = gerar_caminho_unico(run_dir, f"relatorio_{tag_modelo}_{sufixo_medida}", ".json")
     with open(relatorio_json_path, "w", encoding="utf-8") as f:
         json.dump(
             {
+                "run_id": run_id,
+                "timestamp": timestamp_exec,
+                "run_dir": run_dir,
                 "modelo_caminho": model_resolvido,
                 "modelo_nome": nome_run_modelo,
                 "modelo_tag": tag_modelo,
-                "parametros": {"conf": conf_thresh, "imgsz": imgsz, "measure": measure},
-                "total_imagens_com_gt": len(imagens_filtradas),
-                "total_inferencias_validas": len(registros_inferencia),
-                "falhas_deteccao": falhas_deteccao,
+                "parametros": parametros_exec,
+                "resumo_global": {
+                    "total_imagens_com_gt": len(imagens_filtradas),
+                    "total_inferencias_validas": len(registros_inferencia),
+                    "total_falhas_deteccao": len(falhas_deteccao),
+                    "falhas_deteccao": falhas_deteccao,
+                    "acuracia_media_global_pct": float(np.mean(acuracias_validas)) if acuracias_validas else None,
+                    "mape_medio_global_pct": float(np.mean(mapes_validos)) if mapes_validos else None,
+                },
+                "arquivos_gerados": {
+                    "graficos_png": graficos_salvos,
+                    "csv_resumo_metricas": csv_resumo_path,
+                    "csv_detalhe_amostras": csv_amostras_path,
+                },
                 "metricas_por_medida": resultados_finais,
             },
             f,
@@ -535,10 +844,25 @@ def executar_avaliacao(
             ensure_ascii=False,
         )
 
-    print("\nGráficos e relatórios salvos em:")
+    print(f"\nArtefatos da execução ({run_id}) salvos em '{run_dir}':")
     for g in graficos_salvos:
-        print(f" -> [Gráfico]   {g}")
-    print(f" -> [Relatório] {relatorio_json_path}")
+        print(f" -> [Gráfico PNG]      {g}")
+    print(f" -> [Relatório JSON]   {relatorio_json_path}")
+    print(f" -> [Resumo CSV]       {csv_resumo_path}")
+    print(f" -> [Amostras CSV]     {csv_amostras_path}")
+    if poses_dir and os.path.exists(poses_dir):
+        print(f" -> [Poses Anotadas]   {poses_dir}")
+
+    return {
+        "run_id": run_id,
+        "run_dir": run_dir,
+        "graficos_png": graficos_salvos,
+        "relatorio_json": relatorio_json_path,
+        "csv_resumo": csv_resumo_path,
+        "csv_amostras": csv_amostras_path,
+        "parametros": parametros_exec,
+        "metricas_por_medida": resultados_finais,
+    }
 
 
 if __name__ == "__main__":
@@ -588,7 +912,7 @@ if __name__ == "__main__":
         "--out-dir",
         type=str,
         default="outputs/evaluation",
-        help="Pasta onde os gráficos e relatórios de avaliação serão salvos (padrão: outputs/evaluation)",
+        help="Diretório base onde cada execução criará sua subpasta exclusiva (padrão: outputs/evaluation)",
     )
     parser.add_argument(
         "--dist",
@@ -606,7 +930,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--save-poses",
         action="store_true",
-        help="Se ativado, salva também as imagens individuais anotadas com o esqueleto na pasta outputs/",
+        help="Se ativado, salva também as imagens individuais anotadas com o esqueleto na subpasta poses/ da run",
     )
 
     args = parser.parse_args()
