@@ -52,6 +52,7 @@ class ConfiguracaoTreino:
     # Arquitetura base (.yaml) e dataset
     model_cfg: str = "yolo11s-pose.yaml"
     data_yaml: str = "./dataset_versions/ap-10k-bovidae/data.yaml"
+    resume: Optional[str] = None
 
     # Ciclo de treinamento
     epochs: int = 200
@@ -133,6 +134,19 @@ def configurar_oks_quadrupedes(sigmas: tuple[float, ...] = OKS_SIGMAS_QUADRUPEDE
 
 def validar_configuracao(cfg: ConfiguracaoTreino) -> None:
     """Valida parâmetros críticos antes de inicializar a arquitetura e o treinamento."""
+    if cfg.resume:
+        ckpt_path = Path(cfg.resume)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(
+                f"Checkpoint para retomada (--resume) não encontrado: '{ckpt_path}'."
+            )
+        if ckpt_path.suffix.lower() != ".pt":
+            raise ValueError(
+                f"Para retomar o treinamento, '--resume' deve apontar para um arquivo '.pt' "
+                f"(ex.: '.../weights/last.pt'), não '{cfg.resume}'."
+            )
+        return
+
     ext_cfg = Path(cfg.model_cfg).suffix.lower()
     if ext_cfg not in {".yaml", ".yml"}:
         raise ValueError(
@@ -202,10 +216,24 @@ def exibir_resumo_configuracao(cfg: ConfiguracaoTreino) -> None:
 def treinar_do_zero(cfg: ConfiguracaoTreino) -> Any:
     """
     Inicializa um modelo YOLO Pose do zero a partir da arquitetura YAML informada
+    (ou retoma de um checkpoint last.pt se cfg.resume estiver definido)
     e executa o treinamento preservando as otimizações biométricas do projeto.
     """
     validar_configuracao(cfg)
     configurar_oks_quadrupedes(cfg.sigmas_oks)
+
+    if cfg.resume:
+        print("=" * 76)
+        print("  ONEVISION YOLO POSE — RETOMANDO TREINAMENTO (RESUME)")
+        print("=" * 76)
+        print(f"  Checkpoint (.pt) : {cfg.resume}")
+        print("  Sigmas OKS       : Calibrados para quadrúpedes (AP-10K 17 keypoints)")
+        print("=" * 76)
+
+        model = YOLO(cfg.resume, task="pose")
+        _registrar_callbacks_logging(model)
+        return model.train(resume=True)
+
     exibir_resumo_configuracao(cfg)
 
     # Instancia a arquitetura pura (.yaml), sem pesos pré-treinados (.pt)
@@ -294,6 +322,12 @@ def construir_parser() -> argparse.ArgumentParser:
         default=defaults.data_yaml,
         help="Caminho para o arquivo data.yaml do dataset",
     )
+    grp_arch.add_argument(
+        "--resume",
+        type=str,
+        default=defaults.resume,
+        help="Caminho para o checkpoint last.pt para retomar um treinamento interrompido (ex: runs/pose/onevision-yolo/caprine-v5-head-clean/weights/last.pt)",
+    )
 
     grp_ciclo = parser.add_argument_group("Ciclo de Treino e Resolução")
     grp_ciclo.add_argument("--epochs", type=int, default=defaults.epochs, help="Total de épocas de treinamento")
@@ -346,6 +380,7 @@ def parse_args(argv: Optional[list[str]] = None) -> ConfiguracaoTreino:
     return ConfiguracaoTreino(
         model_cfg=args.model_cfg,
         data_yaml=args.data,
+        resume=args.resume,
         epochs=args.epochs,
         patience=args.patience,
         batch=args.batch,
